@@ -288,19 +288,174 @@ Each region supports offset 0x00-0xFF. Offset + length validated to not exceed 0
 
 ---
 
-## SID 21: SIRCS (Sony IR Remote Control)
+## SID 21: SIRCS (Sony IR Remote Control) - `serv_sircs.c`
 
-Sony SIRCS infrared remote control receiver service. Handler: `sub_239A0`.
+Full SIRCS infrared remote control support. The hardware is wired up on retail systems, the `RMC_IN` pad on the syscon connects to pin 3 of the CSW-001 front panel switch board and pin 17 on the CN4009 service connector (unconfirmed). The receiver components were populated on CEB prototypes but left unpopulated on retail boards, though the traces and pads remain. In 2020, [M4j0r confirmed](https://x.com/MinaRalwasser/status/1222606193883058176) that the SIRCS code path is present from CECHA through the CECHE models.
 
-| Mode | Cmd | Name | Handler | Description |
-|------|-----|------|---------|-------------|
-| 0 | 0x10 | ENABLE/DISABLE | inline | Enable IR receiver (mode 1 or 2, store comm tag for async events) or disable (mode 0, clear subscription). |
-| 0 | 0x11 | READ_IR_CODE | `sub_23A62` | Read last received IR command |
-| 0 | 0x12 | READ_IR_DATA | `sub_23AC2` | Read full IR data (13-byte response with device/command fields) |
-| 0 | 0x13 | GET_IR_STATUS | `sub_2359C` | Query IR receiver state |
-| 16 | - | IR_EVENT_PUSH | `sub_23A2C` | Async push: IR remote button press event delivered to Cell via stored comm tag |
+Wiring a standard TSOP38238 (38kHz IR receiver) to the RMC_IN pad and powering it from 3.3V_EVER supposedly enables full IR remote control of the console.
 
-When enabled, the SIRCS hardware decoder runs on a dedicated task (task 25). Remote button presses generate async notifications to the Cell. This was first introduced on the CEB prototypes, but this code was surprisingly [left in](https://x.com/MinaRalwasser/status/1222606193883058176) after launch
+### Service Commands
+
+Handler: `sub_239A0`. Source: `serv_sircs.c`.
+
+| Mode | Cmd | Name | Handler | Payload | Description |
+|------|-----|------|---------|---------|-------------|
+| 0 | 0x10 | ENABLE/DISABLE | inline | [cmd, mode(1B)] | Enable IR receiver. Mode 0=disable (clear comm tag), 1=all-pass (forward every code), 2=repeat-suppress (filter consecutive duplicates). Stores comm tag for async event delivery. |
+| 0 | 0x11 | SET_FILTER_TABLE | `sub_23A62` | [cmd, flag(1B), code0(3B), code1(3B), code2(3B), code3(3B)] (14B total) | Configure 4-entry IR code filter. flag=0 enables filtering, flag=1 disables. Each code is a 24-bit SIRCS value (big-endian). Non-matching codes are suppressed in mode 2. |
+| 0 | 0x12 | READ_IR_DATA | `sub_23AC2` | [cmd] (1B) | Returns 13-byte response: 4x [code_high, code_mid, code_low] for the 4 configured button mapping codes (power, reset, eject, custom). |
+| 0 | 0x13 | SET_BUTTON_MAP | `sub_2359C` | [cmd, power(3B), reset(3B), custom(3B), eject(3B)] (13B total) | Configure which IR codes map to physical console functions. Each code is 24-bit big-endian. 0xFFFFFF = disabled. Persists to NVS 0x3608-0x3613. |
+| 16 | 0x20 | IR_EVENT_PUSH | `sub_23A2C` -> `sub_23704` | (async, 4B) | Async notification: [0x20, code_high, code_mid, code_low]. Sent to Cell when a valid IR code is received. |
+
+### Hardware Interface
+
+**SB Registers:**
+
+| Address | Name | Description |
+|---------|------|-------------|
+| 0x3105900 | GPIO config | Write 0x5F to enable RMC_IN input, 0xCF to disable |
+| 0x3109000 | SIRCS control | Bit 7: clear capture overflow |
+| 0x3109008 | SIRCS status | Bit 0: capture data available, Bit 2: overflow |
+| 0x3109014 | SIRCS capture data | 8-bit timer count representing pulse width |
+
+The Southbridge contains a dedicated hardware timer/capture unit for the RMC_IN pin. It automatically measures pulse widths and stores them in a FIFO. The SIRCS task reads up to 10 capture values per interrupt event via `sub_16CB6`.
+
+### SIRCS Protocol Decoder
+
+The firmware implements a complete SIRCS decoder supporting all three standard variants.
+
+**Supported Variants:**
+- 12-bit SIRCS: 7-bit command + 5-bit device address
+- 15-bit SIRCS: 7-bit command + 8-bit device address
+- 20-bit SIRCS: 7-bit command + 13-bit extended device address
+
+**Pulse Classification (`sub_16C80`):**
+
+The raw timer capture value is compared against 5 threshold ranges (min/max pairs at context+7):
+
+| Index | Meaning | Typical SIRCS Timing |
+|-------|---------|---------------------|
+| 0 | Error / unrecognized | - |
+| 1 | Short pulse (logic 0) | ~0.6ms |
+| 2 | Long pulse (logic 1) | ~1.2ms |
+| 3 | Start bit (header) | ~2.4ms |
+| 4 | Gap / end of frame | >2.4ms or timeout |
+| 253 | Frame end marker | Internal: all bits received |
+| 255 | Invalid / no data | - |
+
+**Decoder State Machine (`sub_1BAE4`):**
+
+```
+State 0 (Idle)
+    |-- Event 3 (start bit) --> State 1
+    |-- anything else --> stay in State 0
+
+State 1 (Start received, waiting for first data)
+    |-- Event 4/253 (gap/end) --> State 0 (false start)
+    |-- Event 1 or 2 (data bit) --> State 3
+
+State 2 (Between bits, previous bit decoded)
+    |-- Event 4 (gap) --> State 0 (abort)
+    |-- Event 253 (frame end) --> validate bit count:
+    |       if 12, 15, or 20 --> State 4 (COMPLETE)
+    |       else --> State 0 (invalid frame)
+    |-- Event 1 or 2 (next data bit) --> State 3
+
+State 3 (Processing data bit)
+    sub_1BB8C does the actual bit decode:
+    |-- Event 1 (short pulse) --> accumulator unchanged (0 bit), bit_count++, --> State 2
+    |-- Event 2 (long pulse) --> accumulator |= (1 << bit_count), bit_count++, --> State 2
+    |-- Event 3 (start bit) --> State 0 (reset, new frame starting)
+
+State 4 (Complete)
+    Return 4 to caller, auto-reset to State 0
+```
+
+Bits are accumulated LSB-first into a 32-bit accumulator at context+8. The bit counter at context+4 tracks how many bits have been received. Only frames with exactly 12, 15, or 20 bits are accepted as valid SIRCS codes.
+
+**Bit Reordering (`sub_1BABC`):**
+
+After decoding, the raw accumulator value is reordered to separate command from device address:
+
+```
+final_code = (raw & 0x7F) | ((raw >> 7) << 8)
+```
+
+This extracts the low 7 bits as the SIRCS command byte and shifts the remaining bits (device address) into the upper bytes. The result is a 24-bit code stored big-endian as `[device_high, device_low, command]`.
+
+For 12-bit SIRCS: `device_addr[4:0] << 8 | command[6:0]` (5-bit device + 7-bit command)
+For 15-bit SIRCS: `device_addr[7:0] << 8 | command[6:0]` (8-bit device + 7-bit command)
+For 20-bit SIRCS: `device_addr[12:0] << 8 | command[6:0]` (13-bit device + 7-bit command)
+
+### Button Mapping (NVS Persistent)
+
+Four 24-bit codes stored at NVS 0x3608-0x3613 define which IR codes trigger physical console functions. These are loaded at boot by `load_thresholds_from_nvs` (`sub_23702`) and can be reconfigured by the Cell via SID 21 cmd 0x13. Written to NVS via `sub_23984`
+
+| NVS Offset | Size | Context | Function | Handler Called |
+|------------|------|---------|----------|---------------|
+| 0x3608 | 3B | word_2000FEA[5] | Power on/off | `sub_1F360(256)` -- identical to physical power button press |
+| 0x360B | 3B | word_2000FEA[7] | Reset | `sub_1F026` -- identical to physical reset button press |
+| 0x360E | 3B | word_2000FEA[11] | Eject | `sub_1E0FE(0)` -- identical to physical eject button press |
+| 0x3611 | 3B | word_2000FEA[9] | Custom | No direct handler, forwarded to Cell via async notification only |
+
+Value 0xFFFFFF (all bytes 0xFF) = disabled / not configured.
+
+When a decoded IR code matches one of the power/reset/eject mappings, the syscon executes the corresponding hardware function directly, no Cell involvement needed. The console can be powered on from standby via IR, just like the physical power button.
+
+### Code Filter Table (RAM)
+
+A 4-entry filter table at `dword_200B710` controls which IR codes are forwarded to the Cell as async notifications. Configured via SID 21 cmd 0x11.
+
+```
+dword_200B710[0] = filter code 0 (24-bit, 0xFFFFFF = wildcard)
+dword_200B714    = filter code 1
+dword_200B718    = filter code 2
+dword_200B71C    = filter code 3
+```
+
+The filter supports wildcard matching: if the low byte of a filter entry is 0xFF, it matches ANY command with the same device address (only the upper bytes are compared). This allows subscribing to all commands from a specific device.
+
+### Notification Modes
+
+| Mode | Name | Behavior |
+|------|------|----------|
+| 0 | Disabled | All decoded IR codes silently dropped |
+| 1 | All-pass | Every decoded code forwarded to Cell. No repeat filtering. First reception of any code is always forwarded. |
+| 2 | Repeat-suppress | Consecutive duplicate codes are filtered, only the first press is forwarded. A different code or 0xFFFFFF (key release / gap) resets the filter. |
+
+### Key Repeat Handling
+
+`sub_1BAD4` is the key repeat handler, called when event 20481 (0x5001) fires. It sends `0xFFFFFF` as the IR code, which the notification handler interprets as a "key released" event. This allows the Cell to distinguish between a held button and a new press.
+
+### ROM Code Table
+
+25 entries at ROM `0x40334` are copied to RAM `dword_200B720` during init (`sub_23C00`). These are 32-bit little-endian values, likely function pointers to per-button handler routines in the `0x15xxx` address range, NOT raw IR codes. The init function also applies a CRC-16 check and can patch the table from NVS if a valid override block exists.
+
+### Task Architecture
+
+```
+Hardware: RMC_IN pin -> SB timer capture (0x3109000-0x3109014)
+                |
+Task 25 (SIRCS): sub_67B0 -- main loop
+    |-- shell_sleep(-1)  (wait for SB interrupt)
+    |-- sub_23BA0: enable RMC_IN GPIO (write 0x5F to SB 0x3105900)
+    |-- loop:
+    |     |-- sub_16CB6: read capture FIFO (up to 10 pulse widths per event)
+    |     |-- event 0: sub_680E -> sub_1BAE4 (decode pulses)
+    |     |     |-- state machine processes each pulse
+    |     |     |-- on complete frame (state 4):
+    |     |     |     |-- sub_1BABC: reorder bits -> 24-bit code
+    |     |     |     |-- sub_237EC: package into message, post to service queue
+    |     |-- event 20481 (0x5001): sub_1BAD4 -> send 0xFFFFFF (key repeat)
+    |     |-- event 20480 (0x5000): sub_16C68 -> disable, return to sleep
+                |
+Task 18 (SERV_MISC): sub_1428C -> SID 21 dispatch
+    |-- sub_23852: route by mode (0=request, 16=async push)
+    |-- sub_239A0: process Cell commands (enable, filter, button map, read)
+    |-- sub_23704: process decoded IR code
+    |     |-- check against power/reset/eject mappings -> direct hardware action
+    |     |-- check against filter table -> forward to Cell or suppress
+    |     |-- sub_23652: send async notification via msg_post(0x15, ...)
+```
 
 ---
 
