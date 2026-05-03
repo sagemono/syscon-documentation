@@ -102,7 +102,7 @@ All functions in this category compute the error as `base + errlog_slot_for_ctx(
 | 18 | xdr_context_id_probable | 0xDE | Clock Gen IC5002 | 0x2012 | 0x2112 | - |
 | 19 | unk_42074 | 0xDC | Clock Gen IC5004 (ICS9214) | 0x2013 | 0x2113 | - |
 | 32 | g_hdmi_ctx (0x2001268) | I2C | HDMI Controller (SiI, IC2502) | 0x2020 | 0x2120 | - |
-| 34 | 0x420A4 | 0x42 | DVE MultiAV (IC2406) | 0x2022 | 0x2122 | - |
+| 34 | 0x420A4 | 0x42 | Some at Thermal IC at 0x42 | 0x2022 | 0x2122 | - |
 
 #### Write Verify Errors (base 0x2200)
 
